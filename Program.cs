@@ -159,23 +159,30 @@ static string ExecuteWriteFile(JsonElement args)
 static string ExecuteRunCommand(JsonElement args)
 {
     var command = args.GetProperty("command").GetString()!;
-    var process = new System.Diagnostics.Process
+    try
     {
-        StartInfo = new System.Diagnostics.ProcessStartInfo
+        var process = new System.Diagnostics.Process
         {
-            FileName = "cmd.exe",
-            Arguments = $"/c {command}",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        }
-    };
-    process.Start();
-    string output = process.StandardOutput.ReadToEnd();
-    string error = process.StandardError.ReadToEnd();
-    process.WaitForExit();
-    return string.IsNullOrEmpty(error) ? output : $"{output}\nSTDERR: {error}";
+            StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c {command}",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            }
+        };
+        process.Start();
+        string output = process.StandardOutput.ReadToEnd();
+        string error = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return string.IsNullOrEmpty(error) ? output : $"{output}\nSTDERR: {error}";
+    }
+    catch (Exception ex)
+    {
+        return $"Error running command: {ex.Message}";
+    }
 }
 
 static string ExecuteListFiles(JsonElement args)
@@ -217,24 +224,34 @@ static string ExecuteSearchFiles(JsonElement args)
 
 static string RunGit(string repoPath, string arguments)
 {
-    var process = new System.Diagnostics.Process
+    if (!Directory.Exists(repoPath))
+        return $"Error: Directory not found: {repoPath}";
+
+    try
     {
-        StartInfo = new System.Diagnostics.ProcessStartInfo
+        var process = new System.Diagnostics.Process
         {
-            FileName = "git",
-            Arguments = arguments,
-            WorkingDirectory = repoPath,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        }
-    };
-    process.Start();
-    string output = process.StandardOutput.ReadToEnd();
-    string error  = process.StandardError.ReadToEnd();
-    process.WaitForExit();
-    return string.IsNullOrWhiteSpace(output) ? (error.Trim()) : output.Trim();
+            StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = arguments,
+                WorkingDirectory = repoPath,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            }
+        };
+        process.Start();
+        string output = process.StandardOutput.ReadToEnd();
+        string error  = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return string.IsNullOrWhiteSpace(output) ? error.Trim() : output.Trim();
+    }
+    catch (Exception ex)
+    {
+        return $"Error running git: {ex.Message}";
+    }
 }
 
 static string ExecuteGitStatus(JsonElement args)
