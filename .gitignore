@@ -6,6 +6,9 @@
 # dotenv files
 .env
 
+# DevAgent local data — personal and machine-specific, never commit
+history.json
+
 # User-specific files
 *.rsuser
 *.suo
