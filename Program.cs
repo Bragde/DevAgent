@@ -426,58 +426,104 @@ while (true)
 
     messages.Add(new UserChatMessage(userInput));
 
-    // Agent loop — keeps running until the model stops calling tools
+    var options = new ChatCompletionOptions
+    {
+        Tools = { tools[0], tools[1], tools[2], tools[3], tools[4], tools[5], tools[6], tools[7] }
+    };
+
+    // Streaming agent loop — keeps running until the model stops calling tools
     while (true)
     {
-        var response = await client.CompleteChatAsync(messages, new ChatCompletionOptions
+        // Buffers to assemble the streamed response
+        var contentBuilder  = new System.Text.StringBuilder();
+        var toolCallBuffers = new Dictionary<int, (string Id, string Name, System.Text.StringBuilder Args)>();
+        ChatFinishReason? finishReason = null;
+        int turnInputTokens = 0, turnOutputTokens = 0;
+
+        // Print the agent prefix before streaming starts
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.Write("\n🤖 Agent: ");
+        Console.ResetColor();
+
+        await foreach (var update in client.CompleteChatStreamingAsync(messages, options))
         {
-            Tools = { tools[0], tools[1], tools[2], tools[3], tools[4], tools[5], tools[6], tools[7] }
-        });
+            // Stream text content to the console as it arrives
+            foreach (var part in update.ContentUpdate)
+            {
+                Console.Write(part.Text);
+                contentBuilder.Append(part.Text);
+            }
 
-        var result = response.Value;
+            // Assemble tool call chunks by index
+            foreach (var tc in update.ToolCallUpdates)
+            {
+                if (!toolCallBuffers.TryGetValue(tc.Index, out var buf))
+                {
+                    buf = (tc.ToolCallId ?? "", tc.FunctionName ?? "", new System.Text.StringBuilder());
+                    toolCallBuffers[tc.Index] = buf;
+                }
 
-        // Accumulate token usage from every API call in the agent loop
-        sessionInputTokens  += result.Usage?.InputTokenCount  ?? 0;
-        sessionOutputTokens += result.Usage?.OutputTokenCount ?? 0;
+                var updatedId   = !string.IsNullOrEmpty(tc.ToolCallId)   ? tc.ToolCallId   : buf.Id;
+                var updatedName = !string.IsNullOrEmpty(tc.FunctionName) ? tc.FunctionName : buf.Name;
+                if (tc.FunctionArgumentsUpdate is { } argUpdate)
+                    buf.Args.Append(argUpdate.ToString());
 
-        if (result.FinishReason == ChatFinishReason.ToolCalls)
+                toolCallBuffers[tc.Index] = (updatedId, updatedName, buf.Args);
+            }
+
+            if (update.FinishReason.HasValue) finishReason = update.FinishReason;
+
+            // Usage arrives on the last chunk
+            if (update.Usage != null)
+            {
+                turnInputTokens  = update.Usage.InputTokenCount;
+                turnOutputTokens = update.Usage.OutputTokenCount;
+            }
+        }
+
+        if (finishReason == ChatFinishReason.ToolCalls)
         {
-            // Add assistant message with tool calls
-            messages.Add(new AssistantChatMessage(result));
+            Console.WriteLine(); // newline after any partial content
+
+            // Build the assistant message with the assembled tool calls
+            var toolCalls = toolCallBuffers
+                .OrderBy(x => x.Key)
+                .Select(x => ChatToolCall.CreateFunctionToolCall(x.Value.Id, x.Value.Name,
+                    BinaryData.FromString(x.Value.Args.ToString())))
+                .ToList();
+
+            messages.Add(new AssistantChatMessage(toolCalls));
 
             // Execute each tool and feed results back
-            foreach (var toolCall in result.ToolCalls)
+            foreach (var (id, name, argsBuilder) in toolCallBuffers.OrderBy(x => x.Key).Select(x => x.Value))
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"\n⚙️  Tool: {toolCall.FunctionName}({toolCall.FunctionArguments})");
+                Console.WriteLine($"\n⚙️  Tool: {name}({argsBuilder})");
                 Console.ResetColor();
 
-                var toolResult = ExecuteTool(toolCall.FunctionName, toolCall.FunctionArguments.ToString());
+                var toolResult = ExecuteTool(name, argsBuilder.ToString());
 
                 Console.ForegroundColor = ConsoleColor.DarkGray;
                 Console.WriteLine($"   → {toolResult[..Math.Min(200, toolResult.Length)]}...");
                 Console.ResetColor();
 
-                messages.Add(new ToolChatMessage(toolCall.Id, toolResult));
+                messages.Add(new ToolChatMessage(id, toolResult));
             }
-            // Continue the loop so the model can react to tool results
+            // Loop again so the model can react to the tool results
         }
         else
         {
-            // Model is done — print final response
-            var reply = result.Content[0].Text;
-            messages.Add(new AssistantChatMessage(reply));
+            // Final response — streaming is complete
+            Console.WriteLine("\n");
 
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"\n🤖 Agent: {reply}\n");
-            Console.ResetColor();
+            messages.Add(new AssistantChatMessage(contentBuilder.ToString()));
 
-            // Show token usage for this exchange
-            var turnInput    = result.Usage?.InputTokenCount  ?? 0;
-            var turnOutput   = result.Usage?.OutputTokenCount ?? 0;
-            var sessionCost  = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
+            // Accumulate and display token usage
+            sessionInputTokens  += turnInputTokens;
+            sessionOutputTokens += turnOutputTokens;
+            var sessionCost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"📊 Tokens: {turnInput} in / {turnOutput} out | Session total: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${sessionCost:F5}\n");
+            Console.WriteLine($"📊 Tokens: {turnInputTokens} in / {turnOutputTokens} out | Session total: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${sessionCost:F5}\n");
             Console.ResetColor();
 
             // Trim and save history after every reply
