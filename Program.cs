@@ -77,6 +77,49 @@ var tools = new List<ChatTool>
             "required": ["directory", "pattern"]
         }
         """)),
+
+    ChatTool.CreateFunctionTool(
+        "git_status",
+        "Returns the git status of a repository, showing changed, staged, and untracked files.",
+        BinaryData.FromString("""
+        {
+            "type": "object",
+            "properties": {
+                "repo_path": { "type": "string", "description": "Path to the git repository root" }
+            },
+            "required": ["repo_path"]
+        }
+        """)),
+
+    ChatTool.CreateFunctionTool(
+        "git_diff",
+        "Returns the git diff of a repository. Shows unstaged changes by default, or staged changes if specified.",
+        BinaryData.FromString("""
+        {
+            "type": "object",
+            "properties": {
+                "repo_path": { "type": "string", "description": "Path to the git repository root" },
+                "staged":    { "type": "boolean", "description": "If true, shows staged (--cached) diff. Default false." },
+                "file_path": { "type": "string", "description": "Optional: limit diff to a specific file" }
+            },
+            "required": ["repo_path"]
+        }
+        """)),
+
+    ChatTool.CreateFunctionTool(
+        "git_commit",
+        "Stages specified files (or all changes) and creates a git commit with the given message.",
+        BinaryData.FromString("""
+        {
+            "type": "object",
+            "properties": {
+                "repo_path": { "type": "string", "description": "Path to the git repository root" },
+                "message":   { "type": "string", "description": "Commit message" },
+                "files":     { "type": "array", "items": { "type": "string" }, "description": "Files to stage. If empty, stages all changes (git add .)." }
+            },
+            "required": ["repo_path", "message"]
+        }
+        """)),
 };
 
 // ── Tool execution ──────────────────────────────────────────────────────────
@@ -91,6 +134,9 @@ static string ExecuteTool(string name, string argsJson)
         "run_command" => ExecuteRunCommand(args),
         "list_files" => ExecuteListFiles(args),
         "search_files" => ExecuteSearchFiles(args),
+        "git_status"   => ExecuteGitStatus(args),
+        "git_diff"     => ExecuteGitDiff(args),
+        "git_commit"   => ExecuteGitCommit(args),
         _ => $"Unknown tool: {name}"
     };
 }
@@ -169,6 +215,65 @@ static string ExecuteSearchFiles(JsonElement args)
     return string.Join("\n", results);
 }
 
+static string RunGit(string repoPath, string arguments)
+{
+    var process = new System.Diagnostics.Process
+    {
+        StartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            Arguments = arguments,
+            WorkingDirectory = repoPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        }
+    };
+    process.Start();
+    string output = process.StandardOutput.ReadToEnd();
+    string error  = process.StandardError.ReadToEnd();
+    process.WaitForExit();
+    return string.IsNullOrWhiteSpace(output) ? (error.Trim()) : output.Trim();
+}
+
+static string ExecuteGitStatus(JsonElement args)
+{
+    var repoPath = args.GetProperty("repo_path").GetString()!;
+    return RunGit(repoPath, "status");
+}
+
+static string ExecuteGitDiff(JsonElement args)
+{
+    var repoPath = args.GetProperty("repo_path").GetString()!;
+    var staged   = args.TryGetProperty("staged", out var s) && s.GetBoolean();
+    var filePath = args.TryGetProperty("file_path", out var f) ? f.GetString() : null;
+
+    var arguments = staged ? "diff --cached" : "diff";
+    if (!string.IsNullOrEmpty(filePath)) arguments += $" -- \"{filePath}\"";
+
+    return RunGit(repoPath, arguments);
+}
+
+static string ExecuteGitCommit(JsonElement args)
+{
+    var repoPath = args.GetProperty("repo_path").GetString()!;
+    var message  = args.GetProperty("message").GetString()!;
+    var hasFiles = args.TryGetProperty("files", out var filesEl) && filesEl.GetArrayLength() > 0;
+
+    if (hasFiles)
+    {
+        var files = filesEl.EnumerateArray().Select(f => $"\"{f.GetString()}\"");
+        RunGit(repoPath, $"add {string.Join(" ", files)}");
+    }
+    else
+    {
+        RunGit(repoPath, "add .");
+    }
+
+    return RunGit(repoPath, $"commit -m \"{message}\"");
+}
+
 // ── System prompt ───────────────────────────────────────────────────────────
 var messages = new List<ChatMessage>
 {
@@ -202,7 +307,7 @@ while (true)
     {
         var response = await client.CompleteChatAsync(messages, new ChatCompletionOptions
         {
-            Tools = { tools[0], tools[1], tools[2], tools[3], tools[4] }
+            Tools = { tools[0], tools[1], tools[2], tools[3], tools[4], tools[5], tools[6], tools[7] }
         });
 
         var result = response.Value;
