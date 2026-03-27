@@ -10,6 +10,13 @@ var client = new ChatClient("gpt-4o-mini", apiKey);
 const string HistoryFile = "history.json";
 const int    MaxHistory  = 40; // max messages to keep (excluding system prompt)
 
+// gpt-4o-mini pricing per 1M tokens (as of early 2025)
+const double CostPerInputToken  = 0.15 / 1_000_000;
+const double CostPerOutputToken = 0.60 / 1_000_000;
+
+int sessionInputTokens  = 0;
+int sessionOutputTokens = 0;
+
 // ── Tool definitions ────────────────────────────────────────────────────────
 var tools = new List<ChatTool>
 {
@@ -387,7 +394,7 @@ if (history.Count > 0)
 
 // ── ReAct loop ───────────────────────────────────────────────────────────────
 Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history).\n");
+Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history, 'stats' for token usage).\n");
 Console.ResetColor();
 
 while (true)
@@ -408,6 +415,14 @@ while (true)
         Console.ResetColor();
         continue;
     }
+    if (userInput.Equals("stats", StringComparison.OrdinalIgnoreCase))
+    {
+        var cost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine($"📊 Session tokens: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${cost:F5}\n");
+        Console.ResetColor();
+        continue;
+    }
 
     messages.Add(new UserChatMessage(userInput));
 
@@ -420,6 +435,10 @@ while (true)
         });
 
         var result = response.Value;
+
+        // Accumulate token usage from every API call in the agent loop
+        sessionInputTokens  += result.Usage?.InputTokenCount  ?? 0;
+        sessionOutputTokens += result.Usage?.OutputTokenCount ?? 0;
 
         if (result.FinishReason == ChatFinishReason.ToolCalls)
         {
@@ -451,6 +470,14 @@ while (true)
 
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine($"\n🤖 Agent: {reply}\n");
+            Console.ResetColor();
+
+            // Show token usage for this exchange
+            var turnInput    = result.Usage?.InputTokenCount  ?? 0;
+            var turnOutput   = result.Usage?.OutputTokenCount ?? 0;
+            var sessionCost  = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"📊 Tokens: {turnInput} in / {turnOutput} out | Session total: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${sessionCost:F5}\n");
             Console.ResetColor();
 
             // Trim and save history after every reply
