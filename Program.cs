@@ -7,6 +7,9 @@ string apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
 
 var client = new ChatClient("gpt-4o-mini", apiKey);
 
+const string HistoryFile = "history.json";
+const int    MaxHistory  = 40; // max messages to keep (excluding system prompt)
+
 // ── Tool definitions ────────────────────────────────────────────────────────
 var tools = new List<ChatTool>
 {
@@ -291,6 +294,47 @@ static string ExecuteGitCommit(JsonElement args)
     return RunGit(repoPath, $"commit -m \"{message}\"");
 }
 
+// ── Memory helpers ───────────────────────────────────────────────────────────
+
+// Each entry stored as: { "role": "user"|"assistant", "content": "..." }
+static void SaveHistory(IEnumerable<ChatMessage> messages, string path)
+{
+    var entries = messages
+        .Where(m => m is UserChatMessage or AssistantChatMessage)
+        .Select(m => new
+        {
+            role    = m is UserChatMessage ? "user" : "assistant",
+            content = m is UserChatMessage u
+                        ? u.Content[0].Text
+                        : ((AssistantChatMessage)m).Content.Count > 0
+                            ? ((AssistantChatMessage)m).Content[0].Text
+                            : null
+        })
+        .Where(e => e.content != null)
+        .ToList();
+
+    File.WriteAllText(path, JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true }));
+}
+
+static List<ChatMessage> LoadHistory(string path)
+{
+    if (!File.Exists(path)) return [];
+
+    var json    = File.ReadAllText(path);
+    var entries = JsonSerializer.Deserialize<List<JsonElement>>(json) ?? [];
+    var result  = new List<ChatMessage>();
+
+    foreach (var entry in entries)
+    {
+        var role    = entry.GetProperty("role").GetString();
+        var content = entry.GetProperty("content").GetString() ?? "";
+        if (role == "user")      result.Add(new UserChatMessage(content));
+        if (role == "assistant") result.Add(new AssistantChatMessage(content));
+    }
+
+    return result;
+}
+
 // ── System prompt ───────────────────────────────────────────────────────────
 var messages = new List<ChatMessage>
 {
@@ -329,9 +373,21 @@ var messages = new List<ChatMessage>
         """)
 };
 
+// Load previous conversation history
+var history = LoadHistory(HistoryFile);
+if (history.Count > 0)
+{
+    // Trim to max before loading so we don't start with a bloated context
+    var trimmed = history.TakeLast(MaxHistory).ToList();
+    messages.AddRange(trimmed);
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($"📂 Loaded {trimmed.Count} messages from previous session.\n");
+    Console.ResetColor();
+}
+
 // ── ReAct loop ───────────────────────────────────────────────────────────────
 Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit).\n");
+Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history).\n");
 Console.ResetColor();
 
 while (true)
@@ -343,6 +399,15 @@ while (true)
     var userInput = Console.ReadLine();
     if (string.IsNullOrWhiteSpace(userInput)) continue;
     if (userInput.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
+    if (userInput.Equals("clear", StringComparison.OrdinalIgnoreCase))
+    {
+        messages.RemoveAll(m => m is UserChatMessage or AssistantChatMessage);
+        File.Delete(HistoryFile);
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("🗑️  History cleared.\n");
+        Console.ResetColor();
+        continue;
+    }
 
     messages.Add(new UserChatMessage(userInput));
 
@@ -387,6 +452,11 @@ while (true)
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine($"\n🤖 Agent: {reply}\n");
             Console.ResetColor();
+
+            // Trim and save history after every reply
+            var toSave = messages.Where(m => m is UserChatMessage or AssistantChatMessage).TakeLast(MaxHistory);
+            SaveHistory(toSave, HistoryFile);
+
             break;
         }
     }
