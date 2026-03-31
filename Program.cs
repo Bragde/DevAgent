@@ -342,119 +342,129 @@ static List<ChatMessage> LoadHistory(string path)
     return result;
 }
 
-// ── System prompt ───────────────────────────────────────────────────────────
-var messages = new List<ChatMessage>
+// ── System prompts ──────────────────────────────────────────────────────────
+const string CodeAgentSystemPrompt = """
+    You are an expert software developer assistant with deep knowledge of software engineering,
+    clean code principles, and common development workflows.
+
+    ## Your personality
+    - You think like a senior developer: pragmatic, precise, and focused on working solutions.
+    - You are direct and concise. You don't over-explain unless asked.
+    - You care about code quality: you notice bad patterns, potential bugs, and improvements.
+
+    ## How you work
+    - Always reason step by step before taking action.
+    - Before writing or modifying files, read them first so you understand the context.
+    - When exploring an unfamiliar codebase, start with list_files to understand the structure,
+      then read key files before drawing conclusions.
+    - Prefer small, focused changes over large rewrites.
+    - If a task is ambiguous, ask one clarifying question before proceeding.
+
+    ## Your tools
+    - read_file: Read the contents of a file.
+    - write_file: Write or overwrite a file. Use with care — always read first.
+    - run_command: Run a shell command (build, test, install packages, etc.).
+    - list_files: List contents of a directory.
+    - search_files: Search for a text pattern across files — use this to find usages, definitions, or references.
+    - git_status: Show what files have changed in a git repo.
+    - git_diff: Show the actual code changes (unstaged or staged).
+    - git_commit: Stage and commit files with a message.
+
+    ## Output style
+    - Keep responses short and developer-friendly.
+    - When showing code, always use code blocks with the correct language tag.
+    - After completing a task, give a brief one or two sentence summary of what you did.
+    - If you encounter an error, explain what went wrong and suggest a fix.
+    """;
+
+const string ChatAgentSystemPrompt = """
+    You are a senior software architect and technical mentor with deep knowledge of software design,
+    distributed systems, AI/ML concepts, and engineering best practices.
+
+    ## Your personality
+    - You think at the system level: patterns, tradeoffs, long-term consequences.
+    - You are pedagogic: you meet the developer where they are and build intuition before jumping to solutions.
+    - You use concrete examples and analogies to make abstract concepts tangible.
+    - You challenge assumptions constructively — you ask "why" as much as "how".
+
+    ## How you work
+    - Explain concepts clearly, layering from simple to complex.
+    - When discussing architecture or design, always surface the tradeoffs — nothing is free.
+    - If a question is vague, ask one focused clarifying question before answering.
+    - Connect new concepts to things the developer likely already knows.
+
+    ## Your tools
+    You have read-only access to the codebase to ground your answers in actual code:
+    - read_file: Read the contents of a file.
+    - list_files: List contents of a directory.
+    - search_files: Search for a text pattern across files.
+
+    When asked about this specific codebase, always read the relevant files first before answering.
+    Never guess at implementation details you can verify by reading the code.
+
+    ## Output style
+    - Use clear structure: headers, bullet points, short paragraphs.
+    - Prefer depth over breadth — it's better to explain one thing well than five things shallowly.
+    - End explanations with a concrete takeaway or "so what does this mean for you?" framing.
+    """;
+
+// ── Router ───────────────────────────────────────────────────────────────────
+async Task<string> RouteAsync(string userInput)
 {
-    new SystemChatMessage("""
-        You are an expert software developer assistant with deep knowledge of software engineering,
-        clean code principles, and common development workflows.
-
-        ## Your personality
-        - You think like a senior developer: pragmatic, precise, and focused on working solutions.
-        - You are direct and concise. You don't over-explain unless asked.
-        - You care about code quality: you notice bad patterns, potential bugs, and improvements.
-
-        ## How you work
-        - Always reason step by step before taking action.
-        - Before writing or modifying files, read them first so you understand the context.
-        - When exploring an unfamiliar codebase, start with list_files to understand the structure,
-          then read key files before drawing conclusions.
-        - Prefer small, focused changes over large rewrites.
-        - If a task is ambiguous, ask one clarifying question before proceeding.
-
-        ## Your tools
-        - read_file: Read the contents of a file.
-        - write_file: Write or overwrite a file. Use with care — always read first.
-        - run_command: Run a shell command (build, test, install packages, etc.).
-        - list_files: List contents of a directory.
-        - search_files: Search for a text pattern across files — use this to find usages, definitions, or references.
-        - git_status: Show what files have changed in a git repo.
-        - git_diff: Show the actual code changes (unstaged or staged).
-        - git_commit: Stage and commit files with a message.
-
-        ## Output style
-        - Keep responses short and developer-friendly.
-        - When showing code, always use code blocks with the correct language tag.
-        - After completing a task, give a brief one or two sentence summary of what you did.
-        - If you encounter an error, explain what went wrong and suggest a fix.
-        """)
-};
-
-// Load previous conversation history
-var history = LoadHistory(HistoryFile);
-if (history.Count > 0)
-{
-    // Trim to max before loading so we don't start with a bloated context
-    var trimmed = history.TakeLast(MaxHistory).ToList();
-    messages.AddRange(trimmed);
-    Console.ForegroundColor = ConsoleColor.DarkGray;
-    Console.WriteLine($"📂 Loaded {trimmed.Count} messages from previous session.\n");
-    Console.ResetColor();
-}
-
-// ── ReAct loop ───────────────────────────────────────────────────────────────
-Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history, 'stats' for token usage).\n");
-Console.ResetColor();
-
-while (true)
-{
-    Console.ForegroundColor = ConsoleColor.Green;
-    Console.Write("You: ");
-    Console.ResetColor();
-
-    var userInput = Console.ReadLine();
-    if (string.IsNullOrWhiteSpace(userInput)) continue;
-    if (userInput.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
-    if (userInput.Equals("clear", StringComparison.OrdinalIgnoreCase))
+    var routerMessages = new List<ChatMessage>
     {
-        messages.RemoveAll(m => m is UserChatMessage or AssistantChatMessage);
-        File.Delete(HistoryFile);
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine("🗑️  History cleared.\n");
-        Console.ResetColor();
-        continue;
-    }
-    if (userInput.Equals("stats", StringComparison.OrdinalIgnoreCase))
-    {
-        var cost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine($"📊 Session tokens: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${cost:F5}\n");
-        Console.ResetColor();
-        continue;
-    }
-
-    messages.Add(new UserChatMessage(userInput));
-
-    var options = new ChatCompletionOptions
-    {
-        Tools = { tools[0], tools[1], tools[2], tools[3], tools[4], tools[5], tools[6], tools[7] }
+        new SystemChatMessage("""
+            You are a request router for a developer assistant. Classify the user's request as exactly one word:
+            - "code" — the request involves doing something: writing, editing, running, reading, or inspecting code, files, commands, or git operations.
+            - "chat" — the request involves understanding something: explaining concepts, discussing architecture, reviewing tradeoffs, or answering technical questions.
+            Respond with only "code" or "chat". Nothing else.
+            """),
+        new UserChatMessage(userInput)
     };
 
-    // Streaming agent loop — keeps running until the model stops calling tools
+    var result = await client.CompleteChatAsync(routerMessages);
+    var classification = result.Value.Content[0].Text.Trim().ToLower();
+    return classification == "code" ? "code" : "chat";
+}
+
+// ── Agent runner ─────────────────────────────────────────────────────────────
+// Runs the ReAct loop for a given agent. Mutates conversationHistory by appending
+// the final assistant response. Returns total tokens used for this turn.
+async Task<(int inputTokens, int outputTokens)> RunAgentAsync(
+    string systemPrompt,
+    List<ChatMessage> conversationHistory,
+    List<ChatTool> agentTools,
+    string agentLabel)
+{
+    // Build full context: system prompt + shared conversation history
+    var messages = new List<ChatMessage> { new SystemChatMessage(systemPrompt) };
+    messages.AddRange(conversationHistory);
+
+    var options = new ChatCompletionOptions();
+    foreach (var tool in agentTools)
+        options.Tools.Add(tool);
+
+    int totalInputTokens = 0, totalOutputTokens = 0;
+
     while (true)
     {
-        // Buffers to assemble the streamed response
         var contentBuilder  = new System.Text.StringBuilder();
         var toolCallBuffers = new Dictionary<int, (string Id, string Name, System.Text.StringBuilder Args)>();
         ChatFinishReason? finishReason = null;
         int turnInputTokens = 0, turnOutputTokens = 0;
 
-        // Print the agent prefix before streaming starts
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.Write("\n🤖 Agent: ");
+        Console.Write($"\n{agentLabel}: ");
         Console.ResetColor();
 
         await foreach (var update in client.CompleteChatStreamingAsync(messages, options))
         {
-            // Stream text content to the console as it arrives
             foreach (var part in update.ContentUpdate)
             {
                 Console.Write(part.Text);
                 contentBuilder.Append(part.Text);
             }
 
-            // Assemble tool call chunks by index
             foreach (var tc in update.ToolCallUpdates)
             {
                 if (!toolCallBuffers.TryGetValue(tc.Index, out var buf))
@@ -473,7 +483,6 @@ while (true)
 
             if (update.FinishReason.HasValue) finishReason = update.FinishReason;
 
-            // Usage arrives on the last chunk
             if (update.Usage != null)
             {
                 turnInputTokens  = update.Usage.InputTokenCount;
@@ -481,11 +490,13 @@ while (true)
             }
         }
 
+        totalInputTokens  += turnInputTokens;
+        totalOutputTokens += turnOutputTokens;
+
         if (finishReason == ChatFinishReason.ToolCalls)
         {
-            Console.WriteLine(); // newline after any partial content
+            Console.WriteLine();
 
-            // Build the assistant message with the assembled tool calls
             var toolCalls = toolCallBuffers
                 .OrderBy(x => x.Key)
                 .Select(x => ChatToolCall.CreateFunctionToolCall(x.Value.Id, x.Value.Name,
@@ -494,7 +505,6 @@ while (true)
 
             messages.Add(new AssistantChatMessage(toolCalls));
 
-            // Execute each tool and feed results back
             foreach (var (id, name, argsBuilder) in toolCallBuffers.OrderBy(x => x.Key).Select(x => x.Value))
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
@@ -509,28 +519,96 @@ while (true)
 
                 messages.Add(new ToolChatMessage(id, toolResult));
             }
-            // Loop again so the model can react to the tool results
         }
         else
         {
-            // Final response — streaming is complete
             Console.WriteLine("\n");
 
-            messages.Add(new AssistantChatMessage(contentBuilder.ToString()));
+            // Append final response to the shared conversation history
+            conversationHistory.Add(new AssistantChatMessage(contentBuilder.ToString()));
 
-            // Accumulate and display token usage
-            sessionInputTokens  += turnInputTokens;
-            sessionOutputTokens += turnOutputTokens;
-            var sessionCost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"📊 Tokens: {turnInputTokens} in / {turnOutputTokens} out | Session total: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${sessionCost:F5}\n");
-            Console.ResetColor();
-
-            // Trim and save history after every reply
-            var toSave = messages.Where(m => m is UserChatMessage or AssistantChatMessage).TakeLast(MaxHistory);
-            SaveHistory(toSave, HistoryFile);
-
-            break;
+            return (totalInputTokens, totalOutputTokens);
         }
     }
+}
+
+// ── Conversation history ─────────────────────────────────────────────────────
+var conversationHistory = new List<ChatMessage>();
+
+// Load previous conversation history
+var history = LoadHistory(HistoryFile);
+if (history.Count > 0)
+{
+    var trimmed = history.TakeLast(MaxHistory).ToList();
+    conversationHistory.AddRange(trimmed);
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($"📂 Loaded {trimmed.Count} messages from previous session.\n");
+    Console.ResetColor();
+}
+
+// ── Main loop ────────────────────────────────────────────────────────────────
+Console.ForegroundColor = ConsoleColor.Cyan;
+Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history, 'stats' for token usage).\n");
+Console.ResetColor();
+
+while (true)
+{
+    Console.ForegroundColor = ConsoleColor.Green;
+    Console.Write("You: ");
+    Console.ResetColor();
+
+    var userInput = Console.ReadLine();
+    if (string.IsNullOrWhiteSpace(userInput)) continue;
+    if (userInput.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
+    if (userInput.Equals("clear", StringComparison.OrdinalIgnoreCase))
+    {
+        conversationHistory.Clear();
+        File.Delete(HistoryFile);
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("🗑️  History cleared.\n");
+        Console.ResetColor();
+        continue;
+    }
+    if (userInput.Equals("stats", StringComparison.OrdinalIgnoreCase))
+    {
+        var cost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine($"📊 Session tokens: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${cost:F5}\n");
+        Console.ResetColor();
+        continue;
+    }
+
+    conversationHistory.Add(new UserChatMessage(userInput));
+
+    // Route the request to the appropriate agent
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.Write("🔀 Routing...");
+    Console.ResetColor();
+
+    var route = await RouteAsync(userInput);
+
+    // CodeAgent gets all tools; ArchitectAgent gets read-only tools (no write/run/git)
+    var readOnlyTools = new List<ChatTool> { tools[0], tools[3], tools[4] }; // read_file, list_files, search_files
+
+    var (systemPrompt, agentTools, agentLabel) = route == "code"
+        ? (CodeAgentSystemPrompt, tools, "🔨 CodeAgent")
+        : (ChatAgentSystemPrompt, readOnlyTools, "💬 ArchitectAgent");
+
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($" → {agentLabel}");
+    Console.ResetColor();
+
+    var (turnIn, turnOut) = await RunAgentAsync(systemPrompt, conversationHistory, agentTools, agentLabel);
+
+    sessionInputTokens  += turnIn;
+    sessionOutputTokens += turnOut;
+
+    var sessionCost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($"📊 Tokens: {turnIn} in / {turnOut} out | Session: {sessionInputTokens}/{sessionOutputTokens} | Est. cost: ${sessionCost:F5}\n");
+    Console.ResetColor();
+
+    // Trim and save shared conversation history after every reply
+    var toSave = conversationHistory.Where(m => m is UserChatMessage or AssistantChatMessage).TakeLast(MaxHistory);
+    SaveHistory(toSave, HistoryFile);
 }
