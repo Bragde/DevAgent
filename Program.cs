@@ -1,554 +1,53 @@
-﻿using OpenAI.Chat;
-using System.Text.Json;
+using DevAgent.Agents;
+using DevAgent.Memory;
+using DevAgent.Plugins;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Agents;
+using Microsoft.SemanticKernel.ChatCompletion;
 
-// ── Configuration ──────────────────────────────────────────────────────────
+// ── Configuration ────────────────────────────────────────────────────────────
 string apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
     ?? throw new Exception("Set the OPENAI_API_KEY environment variable.");
 
-var client = new ChatClient("gpt-4o-mini", apiKey);
-
+const string Model       = "gpt-4o-mini";
 const string HistoryFile = "history.json";
-const int    MaxHistory  = 40; // max messages to keep (excluding system prompt)
-
-// gpt-4o-mini pricing per 1M tokens (as of early 2025)
-const double CostPerInputToken  = 0.15 / 1_000_000;
-const double CostPerOutputToken = 0.60 / 1_000_000;
-
-int sessionInputTokens  = 0;
-int sessionOutputTokens = 0;
-
-// ── Tool definitions ────────────────────────────────────────────────────────
-var tools = new List<ChatTool>
-{
-    ChatTool.CreateFunctionTool(
-        "read_file",
-        "Reads the content of a file at the given path.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Absolute or relative file path" }
-            },
-            "required": ["path"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "write_file",
-        "Writes (or overwrites) a file with the given content.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "path":    { "type": "string", "description": "File path to write" },
-                "content": { "type": "string", "description": "Content to write" }
-            },
-            "required": ["path", "content"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "run_command",
-        "Runs a shell command and returns stdout + stderr.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "The command to execute" }
-            },
-            "required": ["command"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "list_files",
-        "Lists files in a directory.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Directory path" }
-            },
-            "required": ["path"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "search_files",
-        "Searches for a text pattern inside files within a directory. Returns matching lines with file paths and line numbers.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "directory": { "type": "string", "description": "Directory to search in" },
-                "pattern":   { "type": "string", "description": "Text or regex pattern to search for" },
-                "extension": { "type": "string", "description": "Optional file extension filter, e.g. '.cs' or '.ts'" }
-            },
-            "required": ["directory", "pattern"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "git_status",
-        "Returns the git status of a repository, showing changed, staged, and untracked files.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "repo_path": { "type": "string", "description": "Path to the git repository root" }
-            },
-            "required": ["repo_path"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "git_diff",
-        "Returns the git diff of a repository. Shows unstaged changes by default, or staged changes if specified.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "repo_path": { "type": "string", "description": "Path to the git repository root" },
-                "staged":    { "type": "boolean", "description": "If true, shows staged (--cached) diff. Default false." },
-                "file_path": { "type": "string", "description": "Optional: limit diff to a specific file" }
-            },
-            "required": ["repo_path"]
-        }
-        """)),
-
-    ChatTool.CreateFunctionTool(
-        "git_commit",
-        "Stages specified files (or all changes) and creates a git commit with the given message.",
-        BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "repo_path": { "type": "string", "description": "Path to the git repository root" },
-                "message":   { "type": "string", "description": "Commit message" },
-                "files":     { "type": "array", "items": { "type": "string" }, "description": "Files to stage. If empty, stages all changes (git add .)." }
-            },
-            "required": ["repo_path", "message"]
-        }
-        """)),
-};
-
-// ── Tool execution ──────────────────────────────────────────────────────────
-static string ExecuteTool(string name, string argsJson)
-{
-    var args = JsonDocument.Parse(argsJson).RootElement;
-
-    return name switch
-    {
-        "read_file" => ExecuteReadFile(args),
-        "write_file" => ExecuteWriteFile(args),
-        "run_command" => ExecuteRunCommand(args),
-        "list_files" => ExecuteListFiles(args),
-        "search_files" => ExecuteSearchFiles(args),
-        "git_status"   => ExecuteGitStatus(args),
-        "git_diff"     => ExecuteGitDiff(args),
-        "git_commit"   => ExecuteGitCommit(args),
-        _ => $"Unknown tool: {name}"
-    };
-}
-
-static string ExecuteReadFile(JsonElement args)
-{
-    var path = args.GetProperty("path").GetString()!;
-    return File.Exists(path) ? File.ReadAllText(path) : $"File not found: {path}";
-}
-
-static string ExecuteWriteFile(JsonElement args)
-{
-    var path = args.GetProperty("path").GetString()!;
-    var content = args.GetProperty("content").GetString()!;
-    Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
-    File.WriteAllText(path, content);
-    return $"File written: {path}";
-}
-
-static string ExecuteRunCommand(JsonElement args)
-{
-    var command = args.GetProperty("command").GetString()!;
-    try
-    {
-        var process = new System.Diagnostics.Process
-        {
-            StartInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = $"/c {command}",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            }
-        };
-        process.Start();
-        string output = process.StandardOutput.ReadToEnd();
-        string error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        return string.IsNullOrEmpty(error) ? output : $"{output}\nSTDERR: {error}";
-    }
-    catch (Exception ex)
-    {
-        return $"Error running command: {ex.Message}";
-    }
-}
-
-static string ExecuteListFiles(JsonElement args)
-{
-    var path = args.GetProperty("path").GetString()!;
-    if (!Directory.Exists(path)) return $"Directory not found: {path}";
-    var entries = Directory.GetFileSystemEntries(path);
-    return string.Join("\n", entries);
-}
-
-static string ExecuteSearchFiles(JsonElement args)
-{
-    var directory = args.GetProperty("directory").GetString()!;
-    var pattern   = args.GetProperty("pattern").GetString()!;
-    var extension = args.TryGetProperty("extension", out var ext) ? ext.GetString() : null;
-
-    if (!Directory.Exists(directory))
-        return $"Directory not found: {directory}";
-
-    var searchPattern = string.IsNullOrEmpty(extension) ? "*.*" : $"*{extension}";
-    var files = Directory.GetFiles(directory, searchPattern, SearchOption.AllDirectories);
-
-    var results = new List<string>();
-    foreach (var file in files)
-    {
-        var lines = File.ReadAllLines(file);
-        for (int i = 0; i < lines.Length; i++)
-        {
-            if (lines[i].Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                results.Add($"{file}:{i + 1}: {lines[i].Trim()}");
-        }
-    }
-
-    if (results.Count == 0) return $"No matches found for '{pattern}'.";
-    if (results.Count > 100) results = [..results.Take(100), $"... ({results.Count - 100} more results truncated)"];
-
-    return string.Join("\n", results);
-}
-
-static string RunGit(string repoPath, string arguments)
-{
-    if (!Directory.Exists(repoPath))
-        return $"Error: Directory not found: {repoPath}";
-
-    try
-    {
-        var process = new System.Diagnostics.Process
-        {
-            StartInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "git",
-                Arguments = arguments,
-                WorkingDirectory = repoPath,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            }
-        };
-        process.Start();
-        string output = process.StandardOutput.ReadToEnd();
-        string error  = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        return string.IsNullOrWhiteSpace(output) ? error.Trim() : output.Trim();
-    }
-    catch (Exception ex)
-    {
-        return $"Error running git: {ex.Message}";
-    }
-}
-
-static string ExecuteGitStatus(JsonElement args)
-{
-    var repoPath = args.GetProperty("repo_path").GetString()!;
-    return RunGit(repoPath, "status");
-}
-
-static string ExecuteGitDiff(JsonElement args)
-{
-    var repoPath = args.GetProperty("repo_path").GetString()!;
-    var staged   = args.TryGetProperty("staged", out var s) && s.GetBoolean();
-    var filePath = args.TryGetProperty("file_path", out var f) ? f.GetString() : null;
-
-    var arguments = staged ? "diff --cached" : "diff";
-    if (!string.IsNullOrEmpty(filePath)) arguments += $" -- \"{filePath}\"";
-
-    return RunGit(repoPath, arguments);
-}
-
-static string ExecuteGitCommit(JsonElement args)
-{
-    var repoPath = args.GetProperty("repo_path").GetString()!;
-    var message  = args.GetProperty("message").GetString()!;
-    var hasFiles = args.TryGetProperty("files", out var filesEl) && filesEl.GetArrayLength() > 0;
-
-    if (hasFiles)
-    {
-        var files = filesEl.EnumerateArray().Select(f => $"\"{f.GetString()}\"");
-        RunGit(repoPath, $"add {string.Join(" ", files)}");
-    }
-    else
-    {
-        RunGit(repoPath, "add .");
-    }
-
-    return RunGit(repoPath, $"commit -m \"{message}\"");
-}
-
-// ── Memory helpers ───────────────────────────────────────────────────────────
-
-// Each entry stored as: { "role": "user"|"assistant", "content": "..." }
-static void SaveHistory(IEnumerable<ChatMessage> messages, string path)
-{
-    var entries = messages
-        .Where(m => m is UserChatMessage or AssistantChatMessage)
-        .Select(m => new
-        {
-            role    = m is UserChatMessage ? "user" : "assistant",
-            content = m is UserChatMessage u
-                        ? u.Content[0].Text
-                        : ((AssistantChatMessage)m).Content.Count > 0
-                            ? ((AssistantChatMessage)m).Content[0].Text
-                            : null
-        })
-        .Where(e => e.content != null)
-        .ToList();
-
-    File.WriteAllText(path, JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true }));
-}
-
-static List<ChatMessage> LoadHistory(string path)
-{
-    if (!File.Exists(path)) return [];
-
-    var json    = File.ReadAllText(path);
-    var entries = JsonSerializer.Deserialize<List<JsonElement>>(json) ?? [];
-    var result  = new List<ChatMessage>();
-
-    foreach (var entry in entries)
-    {
-        var role    = entry.GetProperty("role").GetString();
-        var content = entry.GetProperty("content").GetString() ?? "";
-        if (role == "user")      result.Add(new UserChatMessage(content));
-        if (role == "assistant") result.Add(new AssistantChatMessage(content));
-    }
-
-    return result;
-}
-
-// ── System prompts ──────────────────────────────────────────────────────────
-const string CodeAgentSystemPrompt = """
-    You are an expert software developer assistant with deep knowledge of software engineering,
-    clean code principles, and common development workflows.
-
-    ## Your personality
-    - You think like a senior developer: pragmatic, precise, and focused on working solutions.
-    - You are direct and concise. You don't over-explain unless asked.
-    - You care about code quality: you notice bad patterns, potential bugs, and improvements.
-
-    ## How you work
-    - Always reason step by step before taking action.
-    - Before writing or modifying files, read them first so you understand the context.
-    - When exploring an unfamiliar codebase, start with list_files to understand the structure,
-      then read key files before drawing conclusions.
-    - Prefer small, focused changes over large rewrites.
-    - If a task is ambiguous, ask one clarifying question before proceeding.
-
-    ## Your tools
-    - read_file: Read the contents of a file.
-    - write_file: Write or overwrite a file. Use with care — always read first.
-    - run_command: Run a shell command (build, test, install packages, etc.).
-    - list_files: List contents of a directory.
-    - search_files: Search for a text pattern across files — use this to find usages, definitions, or references.
-    - git_status: Show what files have changed in a git repo.
-    - git_diff: Show the actual code changes (unstaged or staged).
-    - git_commit: Stage and commit files with a message.
-
-    ## Output style
-    - Keep responses short and developer-friendly.
-    - When showing code, always use code blocks with the correct language tag.
-    - After completing a task, give a brief one or two sentence summary of what you did.
-    - If you encounter an error, explain what went wrong and suggest a fix.
-    """;
-
-const string ChatAgentSystemPrompt = """
-    You are a senior software architect and technical mentor with deep knowledge of software design,
-    distributed systems, AI/ML concepts, and engineering best practices.
-
-    ## Your personality
-    - You think at the system level: patterns, tradeoffs, long-term consequences.
-    - You are pedagogic: you meet the developer where they are and build intuition before jumping to solutions.
-    - You use concrete examples and analogies to make abstract concepts tangible.
-    - You challenge assumptions constructively — you ask "why" as much as "how".
-
-    ## How you work
-    - Explain concepts clearly, layering from simple to complex.
-    - When discussing architecture or design, always surface the tradeoffs — nothing is free.
-    - If a question is vague, ask one focused clarifying question before answering.
-    - Connect new concepts to things the developer likely already knows.
-
-    ## Your tools
-    You have read-only access to the codebase to ground your answers in actual code:
-    - read_file: Read the contents of a file.
-    - list_files: List contents of a directory.
-    - search_files: Search for a text pattern across files.
-
-    When asked about this specific codebase, always read the relevant files first before answering.
-    Never guess at implementation details you can verify by reading the code.
-
-    ## Output style
-    - Use clear structure: headers, bullet points, short paragraphs.
-    - Prefer depth over breadth — it's better to explain one thing well than five things shallowly.
-    - End explanations with a concrete takeaway or "so what does this mean for you?" framing.
-    """;
-
-// ── Router ───────────────────────────────────────────────────────────────────
-async Task<string> RouteAsync(string userInput)
-{
-    var routerMessages = new List<ChatMessage>
-    {
-        new SystemChatMessage("""
-            You are a request router for a developer assistant. Classify the user's request as exactly one word:
-            - "code" — the request involves doing something: writing, editing, running, reading, or inspecting code, files, commands, or git operations.
-            - "chat" — the request involves understanding something: explaining concepts, discussing architecture, reviewing tradeoffs, or answering technical questions.
-            Respond with only "code" or "chat". Nothing else.
-            """),
-        new UserChatMessage(userInput)
-    };
-
-    var result = await client.CompleteChatAsync(routerMessages);
-    var classification = result.Value.Content[0].Text.Trim().ToLower();
-    return classification == "code" ? "code" : "chat";
-}
-
-// ── Agent runner ─────────────────────────────────────────────────────────────
-// Runs the ReAct loop for a given agent. Mutates conversationHistory by appending
-// the final assistant response. Returns total tokens used for this turn.
-async Task<(int inputTokens, int outputTokens)> RunAgentAsync(
-    string systemPrompt,
-    List<ChatMessage> conversationHistory,
-    List<ChatTool> agentTools,
-    string agentLabel)
-{
-    // Build full context: system prompt + shared conversation history
-    var messages = new List<ChatMessage> { new SystemChatMessage(systemPrompt) };
-    messages.AddRange(conversationHistory);
-
-    var options = new ChatCompletionOptions();
-    foreach (var tool in agentTools)
-        options.Tools.Add(tool);
-
-    int totalInputTokens = 0, totalOutputTokens = 0;
-
-    while (true)
-    {
-        var contentBuilder  = new System.Text.StringBuilder();
-        var toolCallBuffers = new Dictionary<int, (string Id, string Name, System.Text.StringBuilder Args)>();
-        ChatFinishReason? finishReason = null;
-        int turnInputTokens = 0, turnOutputTokens = 0;
-
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.Write($"\n{agentLabel}: ");
-        Console.ResetColor();
-
-        await foreach (var update in client.CompleteChatStreamingAsync(messages, options))
-        {
-            foreach (var part in update.ContentUpdate)
-            {
-                Console.Write(part.Text);
-                contentBuilder.Append(part.Text);
-            }
-
-            foreach (var tc in update.ToolCallUpdates)
-            {
-                if (!toolCallBuffers.TryGetValue(tc.Index, out var buf))
-                {
-                    buf = (tc.ToolCallId ?? "", tc.FunctionName ?? "", new System.Text.StringBuilder());
-                    toolCallBuffers[tc.Index] = buf;
-                }
-
-                var updatedId   = !string.IsNullOrEmpty(tc.ToolCallId)   ? tc.ToolCallId   : buf.Id;
-                var updatedName = !string.IsNullOrEmpty(tc.FunctionName) ? tc.FunctionName : buf.Name;
-                if (tc.FunctionArgumentsUpdate is { } argUpdate)
-                    buf.Args.Append(argUpdate.ToString());
-
-                toolCallBuffers[tc.Index] = (updatedId, updatedName, buf.Args);
-            }
-
-            if (update.FinishReason.HasValue) finishReason = update.FinishReason;
-
-            if (update.Usage != null)
-            {
-                turnInputTokens  = update.Usage.InputTokenCount;
-                turnOutputTokens = update.Usage.OutputTokenCount;
-            }
-        }
-
-        totalInputTokens  += turnInputTokens;
-        totalOutputTokens += turnOutputTokens;
-
-        if (finishReason == ChatFinishReason.ToolCalls)
-        {
-            Console.WriteLine();
-
-            var toolCalls = toolCallBuffers
-                .OrderBy(x => x.Key)
-                .Select(x => ChatToolCall.CreateFunctionToolCall(x.Value.Id, x.Value.Name,
-                    BinaryData.FromString(x.Value.Args.ToString())))
-                .ToList();
-
-            messages.Add(new AssistantChatMessage(toolCalls));
-
-            foreach (var (id, name, argsBuilder) in toolCallBuffers.OrderBy(x => x.Key).Select(x => x.Value))
-            {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"\n⚙️  Tool: {name}({argsBuilder})");
-                Console.ResetColor();
-
-                var toolResult = ExecuteTool(name, argsBuilder.ToString());
-
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.WriteLine($"   → {toolResult[..Math.Min(200, toolResult.Length)]}...");
-                Console.ResetColor();
-
-                messages.Add(new ToolChatMessage(id, toolResult));
-            }
-        }
-        else
-        {
-            Console.WriteLine("\n");
-
-            // Append final response to the shared conversation history
-            conversationHistory.Add(new AssistantChatMessage(contentBuilder.ToString()));
-
-            return (totalInputTokens, totalOutputTokens);
-        }
-    }
-}
-
-// ── Conversation history ─────────────────────────────────────────────────────
-var conversationHistory = new List<ChatMessage>();
-
-// Load previous conversation history
-var history = LoadHistory(HistoryFile);
+const int    MaxHistory  = 40;
+
+// ── Kernel setup ─────────────────────────────────────────────────────────────
+// CodeAgent kernel: full access to all dev tools
+var codeKernel = Kernel.CreateBuilder()
+    .AddOpenAIChatCompletion(Model, apiKey)
+    .Build();
+codeKernel.Plugins.AddFromObject(new DevToolsPlugin(), "DevTools");
+
+// ArchitectAgent kernel: read-only tools (no write/run/git)
+var architectKernel = Kernel.CreateBuilder()
+    .AddOpenAIChatCompletion(Model, apiKey)
+    .Build();
+architectKernel.Plugins.AddFromObject(new ReadOnlyDevToolsPlugin(), "DevTools");
+
+// Router kernel: no tools, just classification
+var routerKernel = Kernel.CreateBuilder()
+    .AddOpenAIChatCompletion(Model, apiKey)
+    .Build();
+
+// ── Agent + router setup ──────────────────────────────────────────────────────
+var codeAgent      = DevAgentFactory.CreateCodeAgent(codeKernel);
+var architectAgent = DevAgentFactory.CreateArchitectAgent(architectKernel);
+var router         = new Router(routerKernel);
+
+// ── Load conversation history ─────────────────────────────────────────────────
+var history = HistoryManager.Load(HistoryFile, MaxHistory);
 if (history.Count > 0)
 {
-    var trimmed = history.TakeLast(MaxHistory).ToList();
-    conversationHistory.AddRange(trimmed);
     Console.ForegroundColor = ConsoleColor.DarkGray;
-    Console.WriteLine($"📂 Loaded {trimmed.Count} messages from previous session.\n");
+    Console.WriteLine($"📂 Loaded {history.Count} messages from previous session.\n");
     Console.ResetColor();
 }
 
-// ── Main loop ────────────────────────────────────────────────────────────────
+// ── Main loop ─────────────────────────────────────────────────────────────────
 Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history, 'stats' for token usage).\n");
+Console.WriteLine("🤖 Dev Agent ready! Type your task (or 'exit' to quit, 'clear' to reset history).\n");
 Console.ResetColor();
 
 while (true)
@@ -562,53 +61,50 @@ while (true)
     if (userInput.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
     if (userInput.Equals("clear", StringComparison.OrdinalIgnoreCase))
     {
-        conversationHistory.Clear();
+        history.Clear();
         File.Delete(HistoryFile);
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine("🗑️  History cleared.\n");
         Console.ResetColor();
         continue;
     }
-    if (userInput.Equals("stats", StringComparison.OrdinalIgnoreCase))
-    {
-        var cost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine($"📊 Session tokens: {sessionInputTokens} in / {sessionOutputTokens} out | Est. cost: ${cost:F5}\n");
-        Console.ResetColor();
-        continue;
-    }
 
-    conversationHistory.Add(new UserChatMessage(userInput));
+    history.AddUserMessage(userInput);
 
-    // Route the request to the appropriate agent
+    // Route the request
     Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.Write("🔀 Routing...");
     Console.ResetColor();
 
-    var route = await RouteAsync(userInput);
-
-    // CodeAgent gets all tools; ArchitectAgent gets read-only tools (no write/run/git)
-    var readOnlyTools = new List<ChatTool> { tools[0], tools[3], tools[4] }; // read_file, list_files, search_files
-
-    var (systemPrompt, agentTools, agentLabel) = route == "code"
-        ? (CodeAgentSystemPrompt, tools, "🔨 CodeAgent")
-        : (ChatAgentSystemPrompt, readOnlyTools, "💬 ArchitectAgent");
+    var route = await router.RouteAsync(userInput);
+    var (agent, agentLabel) = route == "code"
+        ? (codeAgent, "🔨 CodeAgent")
+        : (architectAgent, "💬 ArchitectAgent");
 
     Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.WriteLine($" → {agentLabel}");
     Console.ResetColor();
 
-    var (turnIn, turnOut) = await RunAgentAsync(systemPrompt, conversationHistory, agentTools, agentLabel);
-
-    sessionInputTokens  += turnIn;
-    sessionOutputTokens += turnOut;
-
-    var sessionCost = (sessionInputTokens * CostPerInputToken) + (sessionOutputTokens * CostPerOutputToken);
-    Console.ForegroundColor = ConsoleColor.DarkGray;
-    Console.WriteLine($"📊 Tokens: {turnIn} in / {turnOut} out | Session: {sessionInputTokens}/{sessionOutputTokens} | Est. cost: ${sessionCost:F5}\n");
+    // Stream the agent response
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write($"\n{agentLabel}: ");
     Console.ResetColor();
 
-    // Trim and save shared conversation history after every reply
-    var toSave = conversationHistory.Where(m => m is UserChatMessage or AssistantChatMessage).TakeLast(MaxHistory);
-    SaveHistory(toSave, HistoryFile);
+    var responseBuilder = new System.Text.StringBuilder();
+
+    await foreach (var chunk in agent.InvokeStreamingAsync(history))
+    {
+        var text = chunk.ToString();
+        if (!string.IsNullOrEmpty(text))
+        {
+            Console.Write(text);
+            responseBuilder.Append(text);
+        }
+    }
+
+    Console.WriteLine("\n");
+
+    // Add final response to history and save
+    history.AddAssistantMessage(responseBuilder.ToString());
+    HistoryManager.Save(history, HistoryFile, MaxHistory);
 }
